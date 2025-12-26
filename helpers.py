@@ -239,8 +239,8 @@ class Dataset(torch.utils.data.Dataset):
             self.seq_mask_y[i, :self.seq_length[i], :] = 1
             
 
-class vaccine_env():
-    def __init__(self, rnn, hidden_size, age, imm_baseline, gender, race, visitsCat, comCat, age_dummies = None, vax_cost = 0, reward_type = "log"):
+class booster_env():
+    def __init__(self, rnn, hidden_size, age, imm_baseline, gender, race, visitsCat, comCat, variant, vaccine_hist, age_dummies = None, vax_cost = 0, reward_type = "log"):
         self.rnn = rnn
         self.hidden_size = hidden_size
         self.age = age
@@ -250,22 +250,42 @@ class vaccine_env():
         self.race = race + 0
         self.visitsCat = visitsCat
         self.comCat = comCat
-        self.numVax = 0
-        self.step_num = 0
         self.nextMonthInf = False
-        self.monthsLastVax = -1
-        self.monthsLastInf = -1
+    
+        hist_t = vaccine_hist.shape[0]
+        variant_dummies = np.array(pd.get_dummies(
+            pd.cut(variant, bins = [0, 1, 2, 3], include_lowest = True, right = False)
+                                                    ) + 0)[:, 1:]
+        self.action_state_to_date = np.hstack([vaccine_hist.reshape(-1, 1), 
+                                               np.repeat(self.age, hist_t).reshape(-1, 1), 
+                                               np.repeat(self.imm_baseline, hist_t).reshape(-1, 1), 
+                                               np.cumsum(vaccine_hist).reshape(-1, 1), 
+                                               np.repeat(gender, hist_t).reshape(-1, 1), 
+                                               np.tile(self.race, (hist_t, 1)),
+                                               np.tile(self.visitsCat, (hist_t, 1)), 
+                                               np.tile(self.comCat, (hist_t, 1)), 
+                                               variant_dummies]).astype(np.float32)
         
-        self.state = np.concatenate(([self.age, self.imm_baseline, self.numVax, self.gender], 
-                                      self.race, self.visitsCat, self.comCat, np.zeros(2))).astype(np.float32)
-        self.action_state_to_date = np.empty((0, self.state.shape[0] + 1))
-        
+        self.state = self.action_state_to_date[-1, 1:]
         if self.age_dummies is not None:
-            self.state = np.concatenate((self.age_dummies, [self.imm_baseline, self.numVax, self.gender], 
-                                         self.race, self.visitsCat, self.comCat, np.zeros(2))).astype(np.float32)
+            self.state = np.concatenate((self.age_dummies, self.state[1:])).astype(np.float32)
+        
+        self.numVax = np.cumsum(vaccine_hist)[-1]
+        self.step_num = hist_t
+        
+        self.monthsLastVax = 0
+        self.monthsLastVax_cat = 0
+        self.monthsLastInf = -1
 
         self.vax_cost = vax_cost
         self.reward_type = reward_type
+        
+        if len(np.where(age_dummies == True)[0]) == 0:
+            self.age_cat = 0
+        else:
+            self.age_cat = np.where(age_dummies == True)[0][0] + 1
+        self.tq_state = [self.age_cat, imm_baseline, self.monthsLastVax_cat]
+        #self.tq_state = [self.age_cat, imm_baseline]
     
     def step(self, action):
         done = False
@@ -280,7 +300,7 @@ class vaccine_env():
                 self.monthsLastInf += 1
 
         if action:
-            self.monthsLastVax = 0
+            self.monthsLastVax = 1
         else:
             if self.monthsLastVax >= 0:
                 self.monthsLastVax += 1
@@ -291,12 +311,15 @@ class vaccine_env():
             self.variant = 1
         else:
             self.variant = 2
+            
+        self.monthsLastVax_cat = np.where( np.array(pd.get_dummies(
+            pd.cut([self.monthsLastVax], bins = [0, 5, 7, 100], include_lowest = True, right = False)
+                                                            ) + 0).reshape(-1) == 1)[0][0]
+        self.tq_state[2] = self.monthsLastVax_cat
         
         self.variant_dummies = np.array(pd.get_dummies(
             pd.cut([self.variant], bins = [0, 1, 2, 3], include_lowest = True, right = False)
                                                             ) + 0).reshape(-1)[1:]
-        
-        #infection_this_month = (self.monthsLastInf == 0) + 0
         
         self.state = np.concatenate(([self.age, self.imm_baseline, self.numVax, self.gender], 
                                       self.race, self.visitsCat, self.comCat, self.variant_dummies)).astype(np.float32)
@@ -317,19 +340,21 @@ class vaccine_env():
             risk_severe_inf = risk[0].item()
             self.nextMonthInf = np.random.choice([False, True], p = [1 - risk_inf, risk_inf], size = 1).item()
             self.nextMonthSevereInf = np.random.choice([False, True], p = [1 - risk_severe_inf, risk_severe_inf], size = 1).item()
-            if self.reward_type == "log":
+            if self.reward_type == "linear":
+                reward = - (risk_severe_inf + action * self.vax_cost) * 10000
+            elif self.reward_type == "log":
                 reward = - np.log(risk_severe_inf + action * self.vax_cost)
             elif self.reward_type == "logprop":
                 reward = - np.log(risk_severe_inf * (1 + action * self.vax_cost))
             elif self.reward_type == "prop":
-                reward = - risk_severe_inf * (1 + action * self.vax_cost) * 1000
+                reward = - risk_severe_inf * (1 + action * self.vax_cost) * 10000
             else:
                 raise ValueError("unsupported reward_type")
         
         if self.nextMonthSevereInf:
             done = True
         
-        return self.state, reward, done
+        return self.state, self.tq_state, reward, done
 
 
 def generate_demographics():
